@@ -6,12 +6,19 @@ from pathlib import Path
 import requests
 
 
+MAX_FRAMES = 10
+
+
 def main() -> None:
-    if len(sys.argv) < 3:
-        print("Usage: python test_decode.py <image1> <image2>")
+    if len(sys.argv) < 2:
+        print("Usage: python test_decode.py <image1> [image2 ... image10]")
         sys.exit(1)
 
-    image_paths = [Path(sys.argv[1]), Path(sys.argv[2])]
+    if len(sys.argv) - 1 > MAX_FRAMES:
+        print(f"Too many images: max {MAX_FRAMES}")
+        sys.exit(1)
+
+    image_paths = [Path(arg) for arg in sys.argv[1:]]
     for path in image_paths:
         if not path.exists() or not path.is_file():
             print(f"File not found: {path}")
@@ -25,7 +32,11 @@ def main() -> None:
             handles.append(fh)
             files.append(("frames", (path.name, fh, "image/jpeg")))
 
-        response = requests.post("http://127.0.0.1:8000/decode", files=files, timeout=30)
+        response = requests.post(
+            "http://127.0.0.1:8000/decode",
+            files=files,
+            timeout=30,
+        )
         response.raise_for_status()
         print(response.json())
     except requests.RequestException as exc:
