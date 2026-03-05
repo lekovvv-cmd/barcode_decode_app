@@ -9,18 +9,32 @@ import numpy as np
 from fastapi import UploadFile
 from pyzbar.pyzbar import decode as pyzbar_decode, ZBarSymbol
 
-from .frame_quality import compute_frame_quality, score_and_sort_frames
-from .multi_frame import align_frames_ecc, median_merge
-from .preprocess import (
-    anti_aliasing_prep,
-    deskew,
-    estimate_orientation,
-    generate_variants,
-    normalize_frame,
-    rotate_image,
-    upscale,
-)
-from .type_detection import estimate_code_type
+try:
+    from .frame_quality import compute_frame_quality, score_and_sort_frames
+    from .multi_frame import align_frames_ecc, median_merge
+    from .preprocess import (
+        anti_aliasing_prep,
+        deskew,
+        estimate_orientation,
+        generate_variants,
+        normalize_frame,
+        rotate_image,
+        upscale,
+    )
+    from .type_detection import estimate_code_type
+except ImportError:
+    from frame_quality import compute_frame_quality, score_and_sort_frames
+    from multi_frame import align_frames_ecc, median_merge
+    from preprocess import (
+        anti_aliasing_prep,
+        deskew,
+        estimate_orientation,
+        generate_variants,
+        normalize_frame,
+        rotate_image,
+        upscale,
+    )
+    from type_detection import estimate_code_type
 
 logger = logging.getLogger(__name__)
 
@@ -601,3 +615,4 @@ def _signal_decode_1d(gray: np.ndarray) -> Optional[Dict]:
         "confidence": conf,
         "decoder_agreement": 0.7,
     }
+
