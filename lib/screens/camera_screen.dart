@@ -34,7 +34,6 @@ class _CameraScreenState extends State<CameraScreen>
   bool _isCameraInitialized = false;
   bool _isProcessing = false;
   bool _isDecoding = false;
-  bool _torchOn = false;
   bool _showSuccessFlash = false;
   double _currentZoom = 1.0;
   Timer? _scanTimer;
@@ -321,25 +320,6 @@ class _CameraScreenState extends State<CameraScreen>
     HapticFeedback.mediumImpact();
   }
 
-  Future<void> _toggleTorch() async {
-    final controller = _cameraController;
-    if (controller == null || !_isCameraInitialized) return;
-    try {
-      _torchOn = !_torchOn;
-      await controller.setFlashMode(_torchOn ? FlashMode.torch : FlashMode.off);
-      setState(() {});
-    } catch (_) {}
-  }
-
-  void _showComingSoon(String label) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('$label will be available soon.'),
-        duration: const Duration(milliseconds: 1200),
-      ),
-    );
-  }
-
   Future<void> _applyAutoZoom(
     CameraController controller,
     List<Detection> detections,
@@ -488,12 +468,6 @@ class _CameraScreenState extends State<CameraScreen>
                 ),
               ),
             Positioned(
-              top: 12,
-              left: 12,
-              right: 12,
-              child: _buildTopBar(),
-            ),
-            Positioned(
               left: 12,
               right: 12,
               bottom: 12,
@@ -501,48 +475,6 @@ class _CameraScreenState extends State<CameraScreen>
             ),
           ],
         ),
-      ),
-    );
-  }
-
-  Widget _buildTopBar() {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-      decoration: BoxDecoration(
-        color: const Color(0xAA0C0E10),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: Colors.white12),
-      ),
-      child: Row(
-        children: [
-          const Text(
-            'Barcode AI Scanner',
-            style: TextStyle(
-              color: Colors.white,
-              fontWeight: FontWeight.w700,
-              letterSpacing: 0.2,
-            ),
-          ),
-          const Spacer(),
-          IconButton(
-            onPressed: _toggleTorch,
-            icon: Icon(
-              _torchOn ? Icons.flash_on_rounded : Icons.flash_off_rounded,
-              color: _torchOn ? Colors.greenAccent : Colors.white70,
-            ),
-            tooltip: 'Flashlight',
-          ),
-          IconButton(
-            onPressed: () => _showComingSoon('Camera switch'),
-            icon: const Icon(Icons.cameraswitch_rounded, color: Colors.white70),
-            tooltip: 'Switch camera',
-          ),
-          IconButton(
-            onPressed: () => _showComingSoon('Settings'),
-            icon: const Icon(Icons.tune_rounded, color: Colors.white70),
-            tooltip: 'Settings',
-          ),
-        ],
       ),
     );
   }
@@ -744,4 +676,3 @@ class _ScannerOverlayPainter extends CustomPainter {
     return oldDelegate.roiNormalized != roiNormalized;
   }
 }
-
