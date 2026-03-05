@@ -54,10 +54,11 @@ class ApiService {
 
       for (var i = 0; i < frames.length; i++) {
         final bytes = await frames[i].readAsBytes();
+        final roiBytes = cropToRoi(bytes, roiNormalized);
         request.files.add(
           http.MultipartFile.fromBytes(
             'frames',
-            bytes,
+            roiBytes,
             filename: 'frame_$i.jpg',
           ),
         );
@@ -65,13 +66,15 @@ class ApiService {
 
       final streamedResponse =
           await request.send().timeout(const Duration(seconds: 3));
-      final body =
-          await streamedResponse.stream.bytesToString().timeout(
-                const Duration(seconds: 3),
-              );
+      final body = await streamedResponse.stream
+          .bytesToString()
+          .timeout(const Duration(seconds: 3));
 
       if (streamedResponse.statusCode < 200 ||
           streamedResponse.statusCode >= 300) {
+        debugPrint(
+          'ApiService.detectBarcodes: HTTP ${streamedResponse.statusCode}, body=$body',
+        );
         return [];
       }
 
@@ -96,10 +99,13 @@ class ApiService {
         ),
       ];
     } on TimeoutException {
+      debugPrint('ApiService.detectBarcodes: request timeout');
       return [];
     } on FormatException {
+      debugPrint('ApiService.detectBarcodes: invalid JSON response');
       return [];
-    } catch (_) {
+    } catch (e) {
+      debugPrint('ApiService.detectBarcodes: network/error: $e');
       return [];
     }
   }
