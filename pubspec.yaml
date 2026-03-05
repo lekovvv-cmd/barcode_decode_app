@@ -9,6 +9,7 @@ dependencies:
   flutter:
     sdk: flutter
   camera:
+  camera_windows:
   http:
   path_provider:
   share_plus:
@@ -20,4 +21,5 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+
 

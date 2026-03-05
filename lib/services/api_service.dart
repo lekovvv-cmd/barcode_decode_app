@@ -1,37 +1,107 @@
+import 'dart:async';
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 import 'package:image/image.dart' as img;
 
 import '../models/detection.dart';
 
 class ApiService {
+  static const String _backendFromEnv =
+      String.fromEnvironment('BACKEND_URL', defaultValue: '');
+
   final String baseUrl;
   final Rect roiNormalized;
 
   ApiService({
-    this.baseUrl = 'http://localhost:8000',
+    String? baseUrl,
     Rect? roiNormalized,
-  }) : roiNormalized = roiNormalized ?? const Rect.fromLTWH(0, 0, 1, 1);
+  })  : baseUrl = _resolveBaseUrl(baseUrl),
+        roiNormalized = roiNormalized ?? const Rect.fromLTWH(0, 0, 1, 1);
+
+  static String _resolveBaseUrl(String? customUrl) {
+    if (customUrl != null && customUrl.isNotEmpty) {
+      return customUrl;
+    }
+    if (_backendFromEnv.isNotEmpty) {
+      return _backendFromEnv;
+    }
+
+    if (kIsWeb) {
+      return 'http://localhost:8000';
+    }
+
+    switch (defaultTargetPlatform) {
+      case TargetPlatform.android:
+        // Android emulator maps host loopback to 10.0.2.2.
+        return 'http://10.0.2.2:8000';
+      default:
+        // iOS simulator / desktop running on the same machine.
+        return 'http://localhost:8000';
+    }
+  }
 
   Future<List<Detection>> detectBarcodes(List<XFile> frames) async {
-    // TODO: Replace with real HTTP call to your backend.
-    // For detection we typically send full frames or thumbnails.
+    if (frames.isEmpty) return [];
 
-    await Future.delayed(const Duration(milliseconds: 600));
+    try {
+      final uri = Uri.parse('$baseUrl/decode');
+      final request = http.MultipartRequest('POST', uri);
 
-    final mockResponse = <String, dynamic>{
-      'detections': [
-        {
-          'bbox': [0.25, 0.35, 0.75, 0.55],
-          'confidence': 0.91,
-          'decoded': '5901234123457',
-        },
-      ],
-    };
+      for (var i = 0; i < frames.length; i++) {
+        final bytes = await frames[i].readAsBytes();
+        request.files.add(
+          http.MultipartFile.fromBytes(
+            'frames',
+            bytes,
+            filename: 'frame_$i.jpg',
+          ),
+        );
+      }
 
-    return Detection.listFromJson(mockResponse);
+      final streamedResponse =
+          await request.send().timeout(const Duration(seconds: 3));
+      final body =
+          await streamedResponse.stream.bytesToString().timeout(
+                const Duration(seconds: 3),
+              );
+
+      if (streamedResponse.statusCode < 200 ||
+          streamedResponse.statusCode >= 300) {
+        return [];
+      }
+
+      final decodedJson = jsonDecode(body);
+      if (decodedJson is! Map<String, dynamic>) return [];
+
+      final decoded = decodedJson['decoded'];
+      if (decoded == null || (decoded is String && decoded.isEmpty)) {
+        return [];
+      }
+
+      final confidence = (decodedJson['confidence'] as num?)?.toDouble() ?? 0.0;
+
+      return [
+        Detection(
+          x1: roiNormalized.left,
+          y1: roiNormalized.top,
+          x2: roiNormalized.right,
+          y2: roiNormalized.bottom,
+          confidence: confidence,
+          decoded: decoded.toString(),
+        ),
+      ];
+    } on TimeoutException {
+      return [];
+    } on FormatException {
+      return [];
+    } catch (_) {
+      return [];
+    }
   }
 
   Uint8List cropToRoi(Uint8List bytes, Rect roiNorm) {
@@ -46,9 +116,7 @@ class ApiService {
     final cw = (roiNorm.width * w).round();
     final ch = (roiNorm.height * h).round();
 
-    final cropped =
-        img.copyCrop(image, x: x, y: y, width: cw, height: ch);
+    final cropped = img.copyCrop(image, x: x, y: y, width: cw, height: ch);
     return Uint8List.fromList(img.encodeJpg(cropped, quality: 90));
   }
 }
-
