@@ -1,16 +1,36 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import JSONResponse
 from typing import List
 
-from .decoder import decode_frames
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
+
+try:
+    from .decoder import decode_frames
+except ImportError:
+    from decoder import decode_frames
 
 app = FastAPI(title="Barcode Decode Backend", version="1.0.0")
+
+
+@app.get("/health")
+async def health() -> JSONResponse:
+    return JSONResponse(status_code=200, content={"status": "ok"})
+
+
+@app.get("/version")
+async def version() -> JSONResponse:
+    return JSONResponse(
+        status_code=200,
+        content={
+            "service": "barcode-decoder",
+            "version": "0.1",
+        },
+    )
 
 
 @app.post("/decode")
 async def decode(frames: List[UploadFile] = File(...)) -> JSONResponse:
     if not frames:
-      raise HTTPException(status_code=400, detail="No frames provided")
+        raise HTTPException(status_code=400, detail="No frames provided")
 
     # Limit frames to first 10 as per spec.
     limited_frames = frames[:10]
@@ -37,5 +57,4 @@ def create_app() -> FastAPI:
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("backend.app:app", host="0.0.0.0", port=8000, reload=True)
-
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)

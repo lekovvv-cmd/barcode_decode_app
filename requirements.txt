@@ -1,0 +1,9 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+opencv-python>=4.8
+numpy>=1.24
+pillow>=10
+pyzbar>=0.1.9
+python-multipart>=0.0.9
+scikit-image>=0.22
+zxing-cpp>=2.2
