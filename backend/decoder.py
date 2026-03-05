@@ -383,21 +383,22 @@ def _decode_single_strategy(
 
 
 def _decode_with_pyzbar(gray: np.ndarray) -> Optional[Dict]:
-    symbols = [
-        ZBarSymbol.EAN13,
-        ZBarSymbol.EAN8,
-        ZBarSymbol.UPCA,
-        ZBarSymbol.UPCE,
-        ZBarSymbol.CODE128,
-        ZBarSymbol.CODE39,
-        ZBarSymbol.I25,
-        ZBarSymbol.CODABAR,
-        ZBarSymbol.QRCODE,
-        ZBarSymbol.DATAMATRIX,
-        ZBarSymbol.PDF417,
-        ZBarSymbol.AZTEC,
+    symbol_names = [
+        "EAN13",
+        "EAN8",
+        "UPCA",
+        "UPCE",
+        "CODE128",
+        "CODE39",
+        "I25",
+        "CODABAR",
+        "QRCODE",
+        "DATAMATRIX",
+        "PDF417",
+        "AZTEC",
     ]
-    decoded = pyzbar_decode(gray, symbols=symbols)
+    symbols = [getattr(ZBarSymbol, name) for name in symbol_names if hasattr(ZBarSymbol, name)]
+    decoded = pyzbar_decode(gray, symbols=symbols) if symbols else pyzbar_decode(gray)
     if not decoded:
         return None
 
@@ -615,4 +616,5 @@ def _signal_decode_1d(gray: np.ndarray) -> Optional[Dict]:
         "confidence": conf,
         "decoder_agreement": 0.7,
     }
+
 
