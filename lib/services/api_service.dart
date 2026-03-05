@@ -17,6 +17,12 @@ class ApiService {
   final String baseUrl;
   final Rect roiNormalized;
 
+  int lastLatencyMs = 0;
+  int lastFramesSent = 0;
+  String? lastDecodedValue;
+  String? lastDecodedType;
+  String? lastStrategy;
+
   ApiService({
     String? baseUrl,
     Rect? roiNormalized,
@@ -37,16 +43,21 @@ class ApiService {
 
     switch (defaultTargetPlatform) {
       case TargetPlatform.android:
-        // Android emulator maps host loopback to 10.0.2.2.
         return 'http://10.0.2.2:8000';
       default:
-        // iOS simulator / desktop running on the same machine.
         return 'http://localhost:8000';
     }
   }
 
   Future<List<Detection>> detectBarcodes(List<XFile> frames) async {
     if (frames.isEmpty) return [];
+
+    lastFramesSent = frames.length;
+    lastDecodedValue = null;
+    lastDecodedType = null;
+    lastStrategy = null;
+
+    final stopwatch = Stopwatch()..start();
 
     try {
       final uri = Uri.parse('$baseUrl/decode');
@@ -66,9 +77,10 @@ class ApiService {
 
       final streamedResponse =
           await request.send().timeout(const Duration(seconds: 3));
-      final body = await streamedResponse.stream
-          .bytesToString()
-          .timeout(const Duration(seconds: 3));
+      final body =
+          await streamedResponse.stream.bytesToString().timeout(
+                const Duration(seconds: 3),
+              );
 
       if (streamedResponse.statusCode < 200 ||
           streamedResponse.statusCode >= 300) {
@@ -81,11 +93,15 @@ class ApiService {
       final decodedJson = jsonDecode(body);
       if (decodedJson is! Map<String, dynamic>) return [];
 
+      lastStrategy = decodedJson['strategy']?.toString();
+      lastDecodedType = decodedJson['type']?.toString();
+
       final decoded = decodedJson['decoded'];
       if (decoded == null || (decoded is String && decoded.isEmpty)) {
         return [];
       }
 
+      lastDecodedValue = decoded.toString();
       final confidence = (decodedJson['confidence'] as num?)?.toDouble() ?? 0.0;
 
       return [
@@ -107,6 +123,9 @@ class ApiService {
     } catch (e) {
       debugPrint('ApiService.detectBarcodes: network/error: $e');
       return [];
+    } finally {
+      stopwatch.stop();
+      lastLatencyMs = stopwatch.elapsedMilliseconds;
     }
   }
 
@@ -126,3 +145,4 @@ class ApiService {
     return Uint8List.fromList(img.encodeJpg(cropped, quality: 90));
   }
 }
+

@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
@@ -8,7 +7,6 @@ import 'package:flutter/services.dart';
 
 import '../models/detection.dart';
 import '../models/scan_entry.dart';
-import '../models/tracked_barcode.dart';
 import '../services/api_service.dart';
 import '../services/camera_service.dart';
 import '../services/export_service.dart';
@@ -35,20 +33,26 @@ class _CameraScreenState extends State<CameraScreen>
   CameraController? _cameraController;
   bool _isCameraInitialized = false;
   bool _isProcessing = false;
+  bool _isDecoding = false;
   bool _torchOn = false;
+  bool _showSuccessFlash = false;
   double _currentZoom = 1.0;
   Timer? _scanTimer;
+  Timer? _flashTimer;
+  Timer? _bannerTimer;
+  DateTime? _lastDecodeRequestAt;
+
   Duration _currentInterval = const Duration(milliseconds: 800);
 
   List<Detection> _detections = [];
-  String? _lastDecodedText;
+  String? _decodedBannerText;
   String? _errorMessage;
   final List<ScanEntry> _scanHistory = [];
   final Set<String> _scannedBarcodes = {};
   final List<XFile> _frameBuffer = [];
 
-  // Normalized ROI in the center of the frame (x, y, w, h all in 0..1).
   static const Rect _roiNormalized = Rect.fromLTWH(0.2, 0.3, 0.6, 0.4);
+  static const Duration _decodeCooldown = Duration(milliseconds: 700);
 
   late final AnimationController _scanLineController;
 
@@ -59,7 +63,7 @@ class _CameraScreenState extends State<CameraScreen>
     _apiService = ApiService(roiNormalized: _roiNormalized);
     _scanLineController = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 1500),
+      duration: const Duration(milliseconds: 1400),
     )..repeat(reverse: true);
     _initializeCamera();
   }
@@ -98,16 +102,32 @@ class _CameraScreenState extends State<CameraScreen>
       final quality = _frameQualityService.computeQualityScore(bytes);
 
       _frameBuffer.add(imageFile);
-      if (_frameBuffer.length > 6) {
+      if (_frameBuffer.length > 8) {
         _frameBuffer.removeAt(0);
       }
 
-      if (_frameBuffer.isEmpty) {
+      if (!_canSendDecodeRequest()) {
+        _updateScanInterval();
         return;
       }
 
-      final detections =
-          await _apiService.detectBarcodes(List<XFile>.from(_frameBuffer));
+      final hasVisibleDetection = _detections.any(_isInsideRoiDetection);
+      final framesToSend = _takeLatestFrames(
+        _frameBuffer,
+        maxCount: hasVisibleDetection ? 8 : 4,
+      );
+
+      _lastDecodeRequestAt = DateTime.now();
+      _isDecoding = true;
+      final detections = await _apiService.detectBarcodes(framesToSend);
+      _isDecoding = false;
+
+      debugPrint(
+        'Decode stats: latency=${_apiService.lastLatencyMs}ms '
+        'frames=${_apiService.lastFramesSent} '
+        'decoded=${_apiService.lastDecodedValue ?? '-'} '
+        'strategy=${_apiService.lastStrategy ?? '-'}',
+      );
 
       final stabilizedDetections = _trackingService.trackAndFilter(
         detections: detections,
@@ -127,13 +147,15 @@ class _CameraScreenState extends State<CameraScreen>
       if (!mounted) return;
       setState(() {
         _detections = stabilizedDetections;
-        if (decoded != null && decoded.isNotEmpty) {
-          _handleDecodedBarcode(decoded);
-        }
       });
+
+      if (decoded != null && decoded.isNotEmpty) {
+        _handleDecodedBarcode(decoded, barcodeType: _apiService.lastDecodedType);
+      }
 
       _updateScanInterval();
     } catch (e) {
+      _isDecoding = false;
       if (!mounted) return;
       setState(() {
         _errorMessage = 'Error during capture/detect: $e';
@@ -147,9 +169,37 @@ class _CameraScreenState extends State<CameraScreen>
     }
   }
 
+  bool _canSendDecodeRequest() {
+    if (_isDecoding) return false;
+
+    final lastAt = _lastDecodeRequestAt;
+    if (lastAt == null) return true;
+
+    final elapsed = DateTime.now().difference(lastAt);
+    return elapsed >= _decodeCooldown;
+  }
+
+  bool _isInsideRoiDetection(Detection d) {
+    final cx = (d.x1 + d.x2) / 2;
+    final cy = (d.y1 + d.y2) / 2;
+    return cx >= _roiNormalized.left &&
+        cx <= _roiNormalized.right &&
+        cy >= _roiNormalized.top &&
+        cy <= _roiNormalized.bottom;
+  }
+
+  List<XFile> _takeLatestFrames(List<XFile> frames, {required int maxCount}) {
+    if (frames.length <= maxCount) {
+      return List<XFile>.from(frames);
+    }
+    return List<XFile>.from(frames.sublist(frames.length - maxCount));
+  }
+
   @override
   void dispose() {
     _scanTimer?.cancel();
+    _flashTimer?.cancel();
+    _bannerTimer?.cancel();
     _scanLineController.dispose();
     _cameraController?.dispose();
     super.dispose();
@@ -157,8 +207,7 @@ class _CameraScreenState extends State<CameraScreen>
 
   void _startScanTimer() {
     _scanTimer?.cancel();
-    _scanTimer =
-        Timer.periodic(_currentInterval, (_) => _captureAndDetect());
+    _scanTimer = Timer.periodic(_currentInterval, (_) => _captureAndDetect());
   }
 
   void _updateScanInterval() {
@@ -176,9 +225,9 @@ class _CameraScreenState extends State<CameraScreen>
 
     Duration desired;
     if (hasStable) {
-      desired = const Duration(milliseconds: 200);
+      desired = const Duration(milliseconds: 250);
     } else if (hasCandidate) {
-      desired = const Duration(milliseconds: 400);
+      desired = const Duration(milliseconds: 450);
     } else {
       desired = const Duration(milliseconds: 800);
     }
@@ -188,7 +237,7 @@ class _CameraScreenState extends State<CameraScreen>
     _startScanTimer();
   }
 
-  void _handleDecodedBarcode(String decoded) {
+  void _handleDecodedBarcode(String decoded, {String? barcodeType}) {
     if (_scannedBarcodes.contains(decoded)) {
       return;
     }
@@ -197,9 +246,38 @@ class _CameraScreenState extends State<CameraScreen>
     final now = DateTime.now();
     _scanHistory.insert(
       0,
-      ScanEntry(barcode: decoded, timestamp: now),
+      ScanEntry(
+        barcode: decoded,
+        timestamp: now,
+        barcodeType: barcodeType,
+      ),
     );
-    _lastDecodedText = decoded;
+
+    if (_scanHistory.length > 100) {
+      _scanHistory.removeRange(100, _scanHistory.length);
+    }
+
+    setState(() {
+      _decodedBannerText = decoded;
+      _showSuccessFlash = true;
+    });
+
+    _flashTimer?.cancel();
+    _flashTimer = Timer(const Duration(milliseconds: 200), () {
+      if (!mounted) return;
+      setState(() {
+        _showSuccessFlash = false;
+      });
+    });
+
+    _bannerTimer?.cancel();
+    _bannerTimer = Timer(const Duration(seconds: 2), () {
+      if (!mounted) return;
+      setState(() {
+        _decodedBannerText = null;
+      });
+    });
+
     _playFeedback();
   }
 
@@ -211,10 +289,11 @@ class _CameraScreenState extends State<CameraScreen>
       return;
     }
 
-    final buffer = StringBuffer('barcode,timestamp\n');
+    final buffer = StringBuffer('barcode,timestamp,type\n');
     for (final entry in _scanHistory) {
       final ts = _formatTimestamp(entry.timestamp);
-      buffer.writeln('${entry.barcode},$ts');
+      final type = entry.barcodeType ?? '';
+      buffer.writeln('${entry.barcode},$ts,$type');
     }
 
     try {
@@ -242,37 +321,23 @@ class _CameraScreenState extends State<CameraScreen>
     HapticFeedback.mediumImpact();
   }
 
-  Future<List<XFile>> _prepareFramesForBackend(
-    TrackedBarcode track, {
-    int maxFrames = 10,
-  }) async {
-    final bestFrames = track.getBestFrames(maxCount: maxFrames);
-    final List<XFile> prepared = [];
-
-    for (final frame in bestFrames) {
-      final bytes = await frame.readAsBytes();
-      final cropped = _apiService.cropToRoi(bytes, _roiNormalized);
-
-      final dir = await Directory.systemTemp.createTemp('barcode_roi_');
-      final file = File(
-        '${dir.path}/frame_${DateTime.now().microsecondsSinceEpoch}.jpg',
-      );
-      await file.writeAsBytes(cropped);
-      prepared.add(XFile(file.path));
-    }
-
-    return prepared;
-  }
-
   Future<void> _toggleTorch() async {
     final controller = _cameraController;
     if (controller == null || !_isCameraInitialized) return;
     try {
       _torchOn = !_torchOn;
-      await controller
-          .setFlashMode(_torchOn ? FlashMode.torch : FlashMode.off);
+      await controller.setFlashMode(_torchOn ? FlashMode.torch : FlashMode.off);
       setState(() {});
     } catch (_) {}
+  }
+
+  void _showComingSoon(String label) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('$label will be available soon.'),
+        duration: const Duration(milliseconds: 1200),
+      ),
+    );
   }
 
   Future<void> _applyAutoZoom(
@@ -299,9 +364,7 @@ class _CameraScreenState extends State<CameraScreen>
       targetZoom = 1.0;
     }
 
-    // Smooth zoom to avoid jitter.
-    final smoothed =
-        0.8 * _currentZoom + 0.2 * targetZoom;
+    final smoothed = 0.8 * _currentZoom + 0.2 * targetZoom;
     final clamped = smoothed.clamp(1.0, 4.0).toDouble();
 
     if ((clamped - _currentZoom).abs() > 0.02) {
@@ -312,147 +375,248 @@ class _CameraScreenState extends State<CameraScreen>
 
   @override
   Widget build(BuildContext context) {
-    final controller = _cameraController;
-
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Barcode AI Scanner'),
-      ),
-      backgroundColor: Colors.black,
+      backgroundColor: const Color(0xFF050607),
       body: SafeArea(
-        child: Column(
-          children: [
-            Expanded(
-              child: Center(
-                child: _buildCameraPreview(controller),
-              ),
-            ),
-            const SizedBox(height: 8),
-            _buildDecodedText(),
-            const SizedBox(height: 8),
-            _buildHistoryPanel(),
-          ],
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final isWide = constraints.maxWidth >= 980;
+
+            if (isWide) {
+              return Row(
+                children: [
+                  Expanded(
+                    child: Center(
+                      child: Padding(
+                        padding: const EdgeInsets.all(24),
+                        child: ConstrainedBox(
+                          constraints: const BoxConstraints(maxWidth: 900),
+                          child: _buildScannerStage(),
+                        ),
+                      ),
+                    ),
+                  ),
+                  SizedBox(
+                    width: 360,
+                    child: _buildHistoryPanel(),
+                  ),
+                ],
+              );
+            }
+
+            return Column(
+              children: [
+                Expanded(
+                  child: _buildScannerStage(),
+                ),
+                SizedBox(
+                  height: 260,
+                  child: _buildHistoryPanel(),
+                ),
+              ],
+            );
+          },
         ),
       ),
     );
   }
 
-  Widget _buildCameraPreview(CameraController? controller) {
+  Widget _buildScannerStage() {
+    final controller = _cameraController;
+
     if (_errorMessage != null) {
-      return Text(
-        _errorMessage!,
-        style: const TextStyle(color: Colors.redAccent),
+      return Center(
+        child: Text(
+          _errorMessage!,
+          style: const TextStyle(color: Colors.redAccent),
+          textAlign: TextAlign.center,
+        ),
       );
     }
 
     if (!_isCameraInitialized ||
         controller == null ||
         !controller.value.isInitialized) {
-      return const CircularProgressIndicator();
+      return const Center(
+        child: CircularProgressIndicator(color: Colors.greenAccent),
+      );
     }
 
-    return AspectRatio(
-      aspectRatio: controller.value.aspectRatio,
-      child: Stack(
-        fit: StackFit.expand,
-        children: [
-          CameraPreview(controller),
-          Positioned(
-            top: 16,
-            right: 16,
-            child: IconButton(
-              icon: Icon(
-                _torchOn ? Icons.flash_on : Icons.flash_off,
-                color: Colors.white,
-              ),
-              onPressed: _toggleTorch,
-            ),
+    return Container(
+      margin: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: Colors.white12),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x55000000),
+            blurRadius: 20,
+            offset: Offset(0, 8),
           ),
-          CustomPaint(
-            painter: _RoiPainter(_roiNormalized),
-          ),
-          AnimatedBuilder(
-            animation: _scanLineController,
-            builder: (context, _) {
-              return CustomPaint(
-                painter: ScanLinePainter(
-                  progress: _scanLineController.value,
-                  roi: _roiNormalized,
-                ),
-              );
-            },
-          ),
-          if (_detections.isNotEmpty)
+        ],
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(20),
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            CameraPreview(controller),
             CustomPaint(
-              painter: BoundingBoxPainter(_detections),
+              painter: _ScannerOverlayPainter(_roiNormalized),
             ),
+            AnimatedBuilder(
+              animation: _scanLineController,
+              builder: (context, _) {
+                return CustomPaint(
+                  painter: ScanLinePainter(
+                    progress: _scanLineController.value,
+                    roi: _roiNormalized,
+                  ),
+                );
+              },
+            ),
+            if (_detections.isNotEmpty)
+              CustomPaint(
+                painter: BoundingBoxPainter(_detections),
+              ),
+            if (_showSuccessFlash)
+              IgnorePointer(
+                child: AnimatedOpacity(
+                  opacity: _showSuccessFlash ? 1.0 : 0.0,
+                  duration: const Duration(milliseconds: 140),
+                  child: Container(color: Colors.greenAccent.withOpacity(0.18)),
+                ),
+              ),
+            Positioned(
+              top: 12,
+              left: 12,
+              right: 12,
+              child: _buildTopBar(),
+            ),
+            Positioned(
+              left: 12,
+              right: 12,
+              bottom: 12,
+              child: _buildBottomPanel(),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTopBar() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: const Color(0xAA0C0E10),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.white12),
+      ),
+      child: Row(
+        children: [
+          const Text(
+            'Barcode AI Scanner',
+            style: TextStyle(
+              color: Colors.white,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 0.2,
+            ),
+          ),
+          const Spacer(),
+          IconButton(
+            onPressed: _toggleTorch,
+            icon: Icon(
+              _torchOn ? Icons.flash_on_rounded : Icons.flash_off_rounded,
+              color: _torchOn ? Colors.greenAccent : Colors.white70,
+            ),
+            tooltip: 'Flashlight',
+          ),
+          IconButton(
+            onPressed: () => _showComingSoon('Camera switch'),
+            icon: const Icon(Icons.cameraswitch_rounded, color: Colors.white70),
+            tooltip: 'Switch camera',
+          ),
+          IconButton(
+            onPressed: () => _showComingSoon('Settings'),
+            icon: const Icon(Icons.tune_rounded, color: Colors.white70),
+            tooltip: 'Settings',
+          ),
         ],
       ),
     );
   }
 
-  Widget _buildDecodedText() {
-    if (_lastDecodedText == null) {
-      return const Text(
-        'No barcode detected yet.',
-        style: TextStyle(color: Colors.white70),
-      );
-    }
+  Widget _buildBottomPanel() {
+    final status = _decodedBannerText ?? 'No barcode detected yet.';
 
-    return Column(
-      children: [
-        const Text(
-          'Last decoded barcode:',
-          style: TextStyle(color: Colors.white70),
-        ),
-        const SizedBox(height: 4),
-        Text(
-          _lastDecodedText!,
-          style: const TextStyle(
-            color: Colors.greenAccent,
-            fontSize: 16,
-            fontWeight: FontWeight.bold,
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: const Color(0xB0101215),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.white12),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              status,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: _decodedBannerText == null ? Colors.white70 : Colors.greenAccent,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
           ),
-        ),
-      ],
+          const SizedBox(width: 12),
+          FilledButton.icon(
+            onPressed: _exportCsv,
+            icon: const Icon(Icons.file_upload_outlined, size: 18),
+            label: const Text('Export CSV'),
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xFF1C8F57),
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+            ),
+          ),
+        ],
+      ),
     );
   }
 
   Widget _buildHistoryPanel() {
+    final items = _scanHistory.take(10).toList();
+
     return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+      margin: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+      padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
       decoration: BoxDecoration(
-        color: Colors.grey.shade900,
-        border: const Border(
-          top: BorderSide(color: Colors.white12),
-        ),
+        color: const Color(0xFF121417),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: Colors.white10),
       ),
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              const Text(
-                'Scan history',
+            children: const [
+              Icon(Icons.history_rounded, color: Colors.greenAccent, size: 18),
+              SizedBox(width: 8),
+              Text(
+                'Scan History',
                 style: TextStyle(
                   color: Colors.white,
-                  fontWeight: FontWeight.bold,
+                  fontWeight: FontWeight.w700,
+                  fontSize: 16,
                 ),
-              ),
-              TextButton.icon(
-                onPressed: _exportCsv,
-                icon: const Icon(Icons.upload_file, size: 18),
-                label: const Text('Export CSV'),
               ),
             ],
           ),
-          const SizedBox(height: 4),
-          SizedBox(
-            height: 150,
-            child: _scanHistory.isEmpty
+          const SizedBox(height: 10),
+          Expanded(
+            child: items.isEmpty
                 ? const Center(
                     child: Text(
                       'No scans yet.',
@@ -460,26 +624,45 @@ class _CameraScreenState extends State<CameraScreen>
                     ),
                   )
                 : ListView.separated(
-                    itemCount: _scanHistory.length,
-                    separatorBuilder: (_, __) => const Divider(
-                      height: 1,
-                      color: Colors.white12,
-                    ),
+                    itemCount: items.length,
+                    separatorBuilder: (_, __) => const SizedBox(height: 8),
                     itemBuilder: (context, index) {
-                      final entry = _scanHistory[index];
-                      return ListTile(
-                        dense: true,
-                        contentPadding: EdgeInsets.zero,
-                        title: Text(
-                          entry.barcode,
-                          style: const TextStyle(
-                            color: Colors.greenAccent,
-                            fontWeight: FontWeight.w600,
-                          ),
+                      final entry = items[index];
+                      final type = entry.barcodeType ?? 'UNKNOWN';
+
+                      return Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 10,
                         ),
-                        subtitle: Text(
-                          _formatTimestamp(entry.timestamp),
-                          style: const TextStyle(color: Colors.white70),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF1B1E22),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: Colors.white10),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              entry.barcode,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                color: Colors.greenAccent,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              _formatTimestamp(entry.timestamp),
+                              style: const TextStyle(color: Colors.white70, fontSize: 12),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              'Type: $type',
+                              style: const TextStyle(color: Colors.white60, fontSize: 12),
+                            ),
+                          ],
                         ),
                       );
                     },
@@ -491,30 +674,73 @@ class _CameraScreenState extends State<CameraScreen>
   }
 }
 
-class _RoiPainter extends CustomPainter {
+class _ScannerOverlayPainter extends CustomPainter {
   final Rect roiNormalized;
 
-  _RoiPainter(this.roiNormalized);
+  _ScannerOverlayPainter(this.roiNormalized);
 
   @override
   void paint(Canvas canvas, Size size) {
-    final rect = Rect.fromLTWH(
+    final roi = Rect.fromLTWH(
       roiNormalized.left * size.width,
       roiNormalized.top * size.height,
       roiNormalized.width * size.width,
       roiNormalized.height * size.height,
     );
 
-    final paint = Paint()
-      ..color = Colors.white.withOpacity(0.6)
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 2.0;
+    final full = Path()..addRect(Rect.fromLTWH(0, 0, size.width, size.height));
+    final window = Path()
+      ..addRRect(
+        RRect.fromRectAndRadius(roi, const Radius.circular(16)),
+      );
+    final mask = Path.combine(PathOperation.difference, full, window);
 
-    canvas.drawRect(rect, paint);
+    canvas.drawPath(mask, Paint()..color = Colors.black.withOpacity(0.45));
+
+    final border = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2
+      ..color = Colors.white.withOpacity(0.75);
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(roi, const Radius.circular(16)),
+      border,
+    );
+
+    final corner = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round
+      ..strokeWidth = 4
+      ..color = Colors.greenAccent;
+
+    const cornerLen = 24.0;
+
+    canvas.drawLine(Offset(roi.left, roi.top + cornerLen), Offset(roi.left, roi.top), corner);
+    canvas.drawLine(Offset(roi.left, roi.top), Offset(roi.left + cornerLen, roi.top), corner);
+
+    canvas.drawLine(Offset(roi.right - cornerLen, roi.top), Offset(roi.right, roi.top), corner);
+    canvas.drawLine(Offset(roi.right, roi.top), Offset(roi.right, roi.top + cornerLen), corner);
+
+    canvas.drawLine(
+      Offset(roi.left, roi.bottom - cornerLen),
+      Offset(roi.left, roi.bottom),
+      corner,
+    );
+    canvas.drawLine(Offset(roi.left, roi.bottom), Offset(roi.left + cornerLen, roi.bottom), corner);
+
+    canvas.drawLine(
+      Offset(roi.right - cornerLen, roi.bottom),
+      Offset(roi.right, roi.bottom),
+      corner,
+    );
+    canvas.drawLine(
+      Offset(roi.right, roi.bottom - cornerLen),
+      Offset(roi.right, roi.bottom),
+      corner,
+    );
   }
 
   @override
-  bool shouldRepaint(covariant _RoiPainter oldDelegate) {
+  bool shouldRepaint(covariant _ScannerOverlayPainter oldDelegate) {
     return oldDelegate.roiNormalized != roiNormalized;
   }
 }
