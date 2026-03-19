@@ -19,9 +19,13 @@ class ApiService {
 
   int lastLatencyMs = 0;
   int lastFramesSent = 0;
+  int lastJpegBytes = 0;
   String? lastDecodedValue;
   String? lastDecodedType;
   String? lastStrategy;
+
+  int _dynamicJpegQuality = 72;
+  static const Duration _requestTimeout = Duration(seconds: 5);
 
   ApiService({
     String? baseUrl,
@@ -49,23 +53,33 @@ class ApiService {
     }
   }
 
-  Future<List<Detection>> detectBarcodes(List<XFile> frames) async {
+  Future<List<Detection>> detectBarcodes(
+    List<XFile> frames, {
+    Set<String>? excludeIds,
+  }) async {
     if (frames.isEmpty) return [];
 
     lastFramesSent = frames.length;
     lastDecodedValue = null;
     lastDecodedType = null;
     lastStrategy = null;
+    lastJpegBytes = 0;
 
     final stopwatch = Stopwatch()..start();
 
     try {
       final uri = Uri.parse('$baseUrl/decode');
       final request = http.MultipartRequest('POST', uri);
+      final excludes = excludeIds ?? const <String>{};
+      if (excludes.isNotEmpty) {
+        request.fields['exclude_ids'] = jsonEncode(excludes.toList());
+      }
 
       for (var i = 0; i < frames.length; i++) {
         final bytes = await frames[i].readAsBytes();
-        final roiBytes = cropToRoi(bytes, roiNormalized);
+        final roiBytes = cropToTransportRoi(bytes);
+        lastJpegBytes += roiBytes.length;
+
         request.files.add(
           http.MultipartFile.fromBytes(
             'frames',
@@ -75,11 +89,10 @@ class ApiService {
         );
       }
 
-      final streamedResponse =
-          await request.send().timeout(const Duration(seconds: 3));
+      final streamedResponse = await request.send().timeout(_requestTimeout);
       final body =
           await streamedResponse.stream.bytesToString().timeout(
-                const Duration(seconds: 3),
+                _requestTimeout,
               );
 
       if (streamedResponse.statusCode < 200 ||
@@ -103,13 +116,20 @@ class ApiService {
 
       lastDecodedValue = decoded.toString();
       final confidence = (decodedJson['confidence'] as num?)?.toDouble() ?? 0.0;
+      final bbox = decodedJson['bbox'] as List<dynamic>?;
+      final hasBbox = bbox != null && bbox.length == 4;
+
+      final x1 = hasBbox ? (bbox[0] as num).toDouble() : roiNormalized.left;
+      final y1 = hasBbox ? (bbox[1] as num).toDouble() : roiNormalized.top;
+      final x2 = hasBbox ? (bbox[2] as num).toDouble() : roiNormalized.right;
+      final y2 = hasBbox ? (bbox[3] as num).toDouble() : roiNormalized.bottom;
 
       return [
         Detection(
-          x1: roiNormalized.left,
-          y1: roiNormalized.top,
-          x2: roiNormalized.right,
-          y2: roiNormalized.bottom,
+          x1: x1,
+          y1: y1,
+          x2: x2,
+          y2: y2,
           confidence: confidence,
           decoded: decoded.toString(),
         ),
@@ -126,23 +146,42 @@ class ApiService {
     } finally {
       stopwatch.stop();
       lastLatencyMs = stopwatch.elapsedMilliseconds;
+      _updateDynamicJpegQuality(lastLatencyMs);
     }
   }
 
-  Uint8List cropToRoi(Uint8List bytes, Rect roiNorm) {
+  void _updateDynamicJpegQuality(int latencyMs) {
+    if (latencyMs > 300) {
+      _dynamicJpegQuality = 60;
+      return;
+    }
+    if (latencyMs < 150) {
+      _dynamicJpegQuality = 75;
+      return;
+    }
+    _dynamicJpegQuality = 68;
+  }
+
+  // Send full frame, but cap long side for stable latency over Wi-Fi.
+  Uint8List cropToTransportRoi(Uint8List bytes) {
     final image = img.decodeImage(bytes);
     if (image == null) return bytes;
 
-    final w = image.width;
-    final h = image.height;
+    const targetLongSide = 1024;
+    final longSide = image.width >= image.height ? image.width : image.height;
+    final scale = longSide > targetLongSide ? targetLongSide / longSide : 1.0;
 
-    final x = (roiNorm.left * w).round();
-    final y = (roiNorm.top * h).round();
-    final cw = (roiNorm.width * w).round();
-    final ch = (roiNorm.height * h).round();
+    final resized = scale < 1.0
+        ? img.copyResize(
+            image,
+            width: (image.width * scale).round(),
+            height: (image.height * scale).round(),
+            interpolation: img.Interpolation.linear,
+          )
+        : image;
 
-    final cropped = img.copyCrop(image, x: x, y: y, width: cw, height: ch);
-    return Uint8List.fromList(img.encodeJpg(cropped, quality: 90));
+    return Uint8List.fromList(
+      img.encodeJpg(resized, quality: _dynamicJpegQuality),
+    );
   }
 }
-

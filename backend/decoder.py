@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import re
+import time
 from collections import Counter
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -10,7 +12,7 @@ from fastapi import UploadFile
 from pyzbar.pyzbar import decode as pyzbar_decode, ZBarSymbol
 
 try:
-    from .frame_quality import compute_frame_quality, score_and_sort_frames
+    from .frame_quality import compute_frame_quality
     from .multi_frame import align_frames_ecc, median_merge
     from .preprocess import (
         anti_aliasing_prep,
@@ -23,7 +25,7 @@ try:
     )
     from .type_detection import estimate_code_type
 except ImportError:
-    from frame_quality import compute_frame_quality, score_and_sort_frames
+    from frame_quality import compute_frame_quality
     from multi_frame import align_frames_ecc, median_merge
     from preprocess import (
         anti_aliasing_prep,
@@ -35,6 +37,14 @@ except ImportError:
         upscale,
     )
     from type_detection import estimate_code_type
+
+try:
+    from .yolo_detector import detect_barcode_crops as _detect_barcode_crops
+except Exception:  # pragma: no cover - optional fallback stage dependency
+    try:
+        from yolo_detector import detect_barcode_crops as _detect_barcode_crops
+    except Exception:  # pragma: no cover
+        _detect_barcode_crops = None
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +68,12 @@ SUPPORTED_1D = {
 }
 
 SUPPORTED_2D = {"QRCODE", "DATAMATRIX", "PDF417", "AZTEC"}
+REQUEST_BUDGET_SEC = 2.8
+REQUEST_BUDGET_MAX_SEC = 3.8
+YOLO_DECODE_MAX_CROPS = 4
+_QR_DETECTOR = cv2.QRCodeDetector()
+_GS1_AI01_RE = re.compile(r"\(01\)\s*([0-9]{14})")
+_GS1_AI21_RE = re.compile(r"\(21\)\s*([^\(\)\s]+)")
 
 
 def decode_confidence(
@@ -197,7 +213,79 @@ def _deduplicate_frames(
     return unique
 
 
-async def decode_frames(files: List[UploadFile]) -> Dict:
+def _build_dedup_id(decoded: str, btype: str) -> str:
+    text = (decoded or "").strip()
+    if not text:
+        return "raw:"
+
+    ai01 = _GS1_AI01_RE.search(text)
+    ai21 = _GS1_AI21_RE.search(text)
+    if ai01 and ai21:
+        return f"dm:{ai01.group(1)}:{ai21.group(1)}".lower()
+    if ai01:
+        return f"gtin:{ai01.group(1)}".lower()
+
+    digits = "".join(ch for ch in text if ch.isdigit())
+    t = (btype or "").upper()
+    if t in {"EAN13", "EAN-13"} and len(digits) == 13:
+        return f"gtin:0{digits}".lower()
+    if t in {"UPCA", "UPC-A"} and len(digits) == 12:
+        return f"gtin:0{digits}".lower()
+    if t in {"EAN8", "EAN-8"} and len(digits) == 8:
+        return f"ean8:{digits}".lower()
+    if t in {"UPCE", "UPC-E"} and len(digits) in {7, 8}:
+        return f"upce:{digits}".lower()
+
+    return f"raw:{text.lower()}"
+
+
+def _normalize_excluded_ids(exclude_ids: Optional[Sequence[str]]) -> set[str]:
+    normalized: set[str] = set()
+    for item in exclude_ids or []:
+        value = str(item).strip().lower()
+        if value:
+            normalized.add(value)
+    return normalized
+
+
+def _should_skip_excluded(result: Dict, excluded_ids: set[str]) -> bool:
+    decoded = str(result.get("decoded") or "").strip()
+    btype = str(result.get("type") or "")
+    dedup_id = _build_dedup_id(decoded, btype)
+    result["dedup_id"] = dedup_id
+
+    if not excluded_ids:
+        return False
+
+    keys = {
+        dedup_id.lower(),
+        f"raw:{decoded.lower()}",
+        decoded.lower(),
+    }
+    if any(key in excluded_ids for key in keys):
+        logger.info("decode_skip excluded dedup_id=%s type=%s", dedup_id, btype)
+        return True
+    return False
+
+
+def _compute_decode_budget_sec(frame_count: int, yolo_validated: int) -> float:
+    budget = REQUEST_BUDGET_SEC
+    if frame_count <= 1:
+        budget += 0.35
+    if yolo_validated >= 2:
+        budget += 0.45
+    if yolo_validated >= 4:
+        budget += 0.25
+    return float(min(REQUEST_BUDGET_MAX_SEC, budget))
+
+
+async def decode_frames(
+    files: List[UploadFile],
+    exclude_ids: Optional[Sequence[str]] = None,
+) -> Dict:
+    started_at = time.perf_counter()
+    excluded_set = _normalize_excluded_ids(exclude_ids)
+
     # 1. Load frames to OpenCV, limit to 10.
     images: List[np.ndarray] = []
     for f in files[:10]:
@@ -211,18 +299,72 @@ async def decode_frames(files: List[UploadFile]) -> Dict:
     if not images:
         return {"decoded": None}
 
-    # 2. Normalize and deduplicate near-identical frames.
-    normalized = [normalize_frame(im) for im in images]
-    normalized = _deduplicate_frames(normalized, similarity_threshold=0.95)
-    if not normalized:
+    # 2. Normalize and deduplicate near-identical frames while preserving original resolution.
+    dedup_original: List[np.ndarray] = []
+    dedup_normalized: List[np.ndarray] = []
+    for image in images:
+        normalized = normalize_frame(image)
+        is_dup = False
+        for kept in dedup_normalized:
+            if _frame_similarity(normalized, kept) >= 0.95:
+                is_dup = True
+                break
+        if is_dup:
+            continue
+        dedup_original.append(image)
+        dedup_normalized.append(normalized)
+
+    if not dedup_normalized:
         return {"decoded": None}
 
     # 3. Score quality and keep best up to 10.
-    scored = score_and_sort_frames(tuple(normalized))
-    best_pairs = scored[:10]
-    best_frames = [img for img, _ in best_pairs]
+    scored = sorted(
+        [
+            (idx, compute_frame_quality(gray))
+            for idx, gray in enumerate(dedup_normalized)
+        ],
+        key=lambda item: item[1].quality,
+        reverse=True,
+    )
+    best_indices = [idx for idx, _ in scored[:10]]
+    best_frames = [dedup_normalized[idx] for idx in best_indices]
+    best_original = dedup_original[best_indices[0]]
 
-    # 4. Orientation normalization from best-quality frame.
+    # 4. YOLO-first path for fixed overhead camera setups with small/distant codes.
+    # Early exit on first successful crop decode.
+    yolo_crops: List[Tuple[np.ndarray, Tuple[float, float, float, float]]] = []
+    if _detect_barcode_crops is not None:
+        try:
+            yolo_crops = _detect_barcode_crops(best_original)
+        except Exception as exc:
+            logger.warning("[YOLO] fallback_failed error=%s", exc)
+            yolo_crops = []
+
+    budget_sec = _compute_decode_budget_sec(
+        frame_count=len(best_frames),
+        yolo_validated=len(yolo_crops),
+    )
+
+    for crop, bbox_norm in yolo_crops[:YOLO_DECODE_MAX_CROPS]:
+        if time.perf_counter() - started_at > budget_sec:
+            logger.info("decode_budget_exhausted stage=yolo_crops")
+            return {"decoded": None}
+
+        result = _decode_yolo_crop(crop)
+        if result:
+            if _should_skip_excluded(result, excluded_set):
+                continue
+            result["strategy"] = "yolo_crop"
+            result["frames_used"] = 1
+            result["bbox"] = list(bbox_norm)
+            logger.info("[YOLO-DECODE] success strategy=yolo_crop")
+            return result
+
+    if time.perf_counter() - started_at > budget_sec:
+        logger.info("decode_budget_exhausted stage=post_yolo")
+        return {"decoded": None}
+
+    # 5. Orientation normalization from best-quality frame.
     best_gray = best_frames[0]
     orientation_angle = estimate_orientation(best_gray)
     if abs(orientation_angle) > 0.1:
@@ -230,7 +372,7 @@ async def decode_frames(files: List[UploadFile]) -> Dict:
     else:
         rotated = best_frames
 
-    # 5. Small ROI expansion to avoid cutting finder/guard patterns.
+    # 6. Small ROI expansion to avoid cutting finder/guard patterns.
     expanded = [_expand_roi(im, expansion=0.2) for im in rotated]
 
     # Keep best frame first and get type hint.
@@ -239,40 +381,62 @@ async def decode_frames(files: List[UploadFile]) -> Dict:
     best_q_norm = quality_to_unit_interval(best_q.quality)
     code_type_hint = estimate_code_type(best_gray)
 
-    # 6. Additional deskew pass after orientation normalization.
+    # 7. Additional deskew pass after orientation normalization.
     oriented: List[np.ndarray] = [deskew(img) for img in expanded]
+
+    if time.perf_counter() - started_at > budget_sec:
+        logger.info("decode_budget_exhausted stage=post_orientation")
+        return {"decoded": None}
 
     # 2D special path: prefer single best frame strategies first.
     if code_type_hint == "2D":
         result = _decode_single_strategy(best_gray, frame_quality_norm=best_q_norm)
         if result:
-            result["strategy"] = "best_frame"
-            result["frames_used"] = 1
-            logger.info("decode_success strategy=best_frame type=%s", result.get("type"))
-            return result
+            if not _should_skip_excluded(result, excluded_set):
+                result["strategy"] = "best_frame"
+                result["frames_used"] = 1
+                logger.info(
+                    "decode_success strategy=best_frame type=%s", result.get("type")
+                )
+                return result
 
         up_best = upscale(best_gray, scale=2.0)
         result = _decode_single_strategy(up_best, frame_quality_norm=best_q_norm)
         if result:
-            result["strategy"] = "super_resolution"
-            result["frames_used"] = 1
-            logger.info(
-                "decode_success strategy=super_resolution type=%s",
-                result.get("type"),
-            )
-            return result
+            if not _should_skip_excluded(result, excluded_set):
+                result["strategy"] = "super_resolution"
+                result["frames_used"] = 1
+                logger.info(
+                    "decode_success strategy=super_resolution type=%s",
+                    result.get("type"),
+                )
+                return result
+
+    if time.perf_counter() - started_at > budget_sec:
+        logger.info("decode_budget_exhausted stage=post_2d_single")
+        return {"decoded": None}
 
     # 1D or remaining 2D path: try single-frame ensemble.
     for gray in oriented:
+        if time.perf_counter() - started_at > budget_sec:
+            logger.info("decode_budget_exhausted stage=single_frame_loop")
+            return {"decoded": None}
+
         q_norm = quality_to_unit_interval(compute_frame_quality(gray).quality)
         result = _decode_single_strategy(gray, frame_quality_norm=q_norm)
         if result:
+            if _should_skip_excluded(result, excluded_set):
+                continue
             result["strategy"] = "single_frame"
             result["frames_used"] = 1
             logger.info(
                 "decode_success strategy=single_frame type=%s", result.get("type")
             )
             return result
+
+    if time.perf_counter() - started_at > budget_sec:
+        logger.info("decode_budget_exhausted stage=before_multiframe")
+        return {"decoded": None}
 
     # Multi-frame alignment + median merge.
     try:
@@ -284,43 +448,63 @@ async def decode_frames(files: List[UploadFile]) -> Dict:
     q_med_norm = quality_to_unit_interval(compute_frame_quality(med).quality)
     result = _decode_single_strategy(med, frame_quality_norm=q_med_norm)
     if result:
-        result["strategy"] = "median_multiframe"
-        result["frames_used"] = len(oriented)
-        logger.info(
-            "decode_success strategy=median_multiframe type=%s", result.get("type")
-        )
-        return result
+        if not _should_skip_excluded(result, excluded_set):
+            result["strategy"] = "median_multiframe"
+            result["frames_used"] = len(oriented)
+            logger.info(
+                "decode_success strategy=median_multiframe type=%s", result.get("type")
+            )
+            return result
+
+    if time.perf_counter() - started_at > budget_sec:
+        logger.info("decode_budget_exhausted stage=before_super_resolution")
+        return {"decoded": None}
 
     # Super resolution fallback.
     up = upscale(med, scale=2.5)
     q_up_norm = quality_to_unit_interval(compute_frame_quality(up).quality)
     result = _decode_single_strategy(up, frame_quality_norm=q_up_norm)
     if result:
-        result["strategy"] = "super_resolution"
-        result["frames_used"] = len(oriented)
-        logger.info(
-            "decode_success strategy=super_resolution type=%s", result.get("type")
-        )
-        return result
+        if not _should_skip_excluded(result, excluded_set):
+            result["strategy"] = "super_resolution"
+            result["frames_used"] = len(oriented)
+            logger.info(
+                "decode_success strategy=super_resolution type=%s", result.get("type")
+            )
+            return result
+
+    if time.perf_counter() - started_at > budget_sec:
+        logger.info("decode_budget_exhausted stage=before_aliasing")
+        return {"decoded": None}
 
     # Anti-aliasing pass.
     aa = anti_aliasing_prep(up)
     q_aa_norm = quality_to_unit_interval(compute_frame_quality(aa).quality)
     result = _decode_single_strategy(aa, frame_quality_norm=q_aa_norm)
     if result:
-        result["strategy"] = "aliasing_prep"
-        result["frames_used"] = len(oriented)
-        logger.info("decode_success strategy=aliasing_prep type=%s", result.get("type"))
-        return result
+        if not _should_skip_excluded(result, excluded_set):
+            result["strategy"] = "aliasing_prep"
+            result["frames_used"] = len(oriented)
+            logger.info(
+                "decode_success strategy=aliasing_prep type=%s", result.get("type")
+            )
+            return result
+
+    if time.perf_counter() - started_at > budget_sec:
+        logger.info("decode_budget_exhausted stage=before_signal")
+        return {"decoded": None}
 
     # Final 1D signal extraction fallback.
     if code_type_hint == "1D":
         result = _signal_decode_1d(aa)
         if result:
-            result["strategy"] = "signal_decode"
-            result["frames_used"] = len(oriented)
-            logger.info("decode_success strategy=signal_decode type=%s", result.get("type"))
-            return result
+            if not _should_skip_excluded(result, excluded_set):
+                result["strategy"] = "signal_decode"
+                result["frames_used"] = len(oriented)
+                logger.info(
+                    "decode_success strategy=signal_decode type=%s", result.get("type")
+                )
+                return result
 
     return {"decoded": None}
 
@@ -353,33 +537,134 @@ def _decode_single_strategy(
         if not candidates:
             continue
 
-        value_counter = Counter(c["decoded"] for c in candidates if c.get("decoded"))
-        if not value_counter:
+        selected = _select_best_candidate(
+            candidates,
+            frame_quality_norm=frame_quality_norm,
+        )
+        if selected:
+            return selected
+
+    return None
+
+
+def _select_best_candidate(
+    candidates: List[Dict],
+    frame_quality_norm: float,
+) -> Optional[Dict]:
+    value_counter = Counter(c["decoded"] for c in candidates if c.get("decoded"))
+    if not value_counter:
+        return None
+
+    best: Optional[Dict] = None
+    best_score = -1.0
+
+    for value, count in value_counter.items():
+        same_value = [c for c in candidates if c.get("decoded") == value]
+        if not same_value:
             continue
 
-        winner_value, winner_count = value_counter.most_common(1)[0]
-        winner_candidates = [c for c in candidates if c.get("decoded") == winner_value]
-        winner = winner_candidates[0]
-
-        type_counter = Counter(c.get("type", "UNKNOWN") for c in winner_candidates)
+        type_counter = Counter(c.get("type", "UNKNOWN") for c in same_value)
         winner_type = type_counter.most_common(1)[0][0]
-
-        agreement = float(winner_count / max(1, len(candidates)))
+        agreement = float(count / max(1, len(candidates)))
         confidence = decode_confidence(
-            winner_value,
+            value,
             winner_type,
             frame_quality_norm=frame_quality_norm,
             decoder_agreement=agreement,
         )
 
-        return {
-            "decoded": winner_value,
-            "type": winner_type,
-            "confidence": confidence,
-            "decoder_agreement": agreement,
-        }
+        # Tie-break: valid check-summed 1D codes (EAN/UPC) get a small boost
+        # so they are not shadowed by "first candidate wins" behavior.
+        checksum = checksum_validity(value, winner_type)
+        score = confidence
+        if winner_type in {"EAN13", "EAN8", "UPCA", "UPCE"} and checksum >= 0.99:
+            score += 0.08
 
+        if score > best_score:
+            best_score = score
+            best = {
+                "decoded": value,
+                "type": winner_type,
+                "confidence": float(np.clip(confidence, 0.0, 1.0)),
+                "decoder_agreement": agreement,
+            }
+
+    return best
+
+
+def _decode_yolo_crop(crop: np.ndarray) -> Optional[Dict]:
+    """
+    High-recall industrial decode path for YOLO crops:
+    - upscale x2.5 (critical for tiny labels)
+    - equalize / adaptive-threshold / inverted-threshold / sharpen variants
+    - try 0/90/180/270 rotations
+    """
+    versions = _preprocess_versions_for_crop(crop)
+    for version in versions:
+        q_norm = quality_to_unit_interval(compute_frame_quality(version).quality)
+        result = _decode_direct_ensemble(version, frame_quality_norm=q_norm)
+        if result:
+            return result
+
+        for k in (1, 2, 3):
+            rotated = np.rot90(version, k=k).copy()
+            q_rot_norm = quality_to_unit_interval(compute_frame_quality(rotated).quality)
+            result = _decode_direct_ensemble(rotated, frame_quality_norm=q_rot_norm)
+            if result:
+                return result
     return None
+
+
+def _preprocess_versions_for_crop(crop: np.ndarray) -> List[np.ndarray]:
+    versions: List[np.ndarray] = []
+    big = cv2.resize(crop, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY) if big.ndim == 3 else big
+
+    versions.append(gray)
+    versions.append(cv2.equalizeHist(gray))
+
+    thr = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        3,
+    )
+    versions.append(thr)
+    versions.append(255 - thr)
+
+    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
+    versions.append(cv2.filter2D(gray, -1, kernel))
+    return versions
+
+
+def _decode_direct_ensemble(gray: np.ndarray, frame_quality_norm: float) -> Optional[Dict]:
+    candidates: List[Dict] = []
+
+    if ZXING_AVAILABLE:
+        zxing_res = _decode_with_zxing(gray)
+        if zxing_res:
+            zxing_res["decoder"] = "zxing"
+            candidates.append(zxing_res)
+
+    pyzbar_res = _decode_with_pyzbar(gray)
+    if pyzbar_res:
+        pyzbar_res["decoder"] = "pyzbar"
+        candidates.append(pyzbar_res)
+
+    opencv_res = _decode_with_opencv(gray)
+    if opencv_res:
+        opencv_res["decoder"] = "opencv"
+        candidates.append(opencv_res)
+
+    if not candidates:
+        return None
+
+    return _select_best_candidate(
+        candidates,
+        frame_quality_norm=frame_quality_norm,
+    )
 
 
 def _decode_with_pyzbar(gray: np.ndarray) -> Optional[Dict]:
@@ -425,8 +710,7 @@ def _decode_with_zxing(gray: np.ndarray) -> Optional[Dict]:
 
 
 def _decode_with_opencv(gray: np.ndarray) -> Optional[Dict]:
-    detector = cv2.QRCodeDetector()
-    data, points, _ = detector.detectAndDecode(gray)
+    data, points, _ = _QR_DETECTOR.detectAndDecode(gray)
     if not data:
         return None
     return {
@@ -616,5 +900,3 @@ def _signal_decode_1d(gray: np.ndarray) -> Optional[Dict]:
         "confidence": conf,
         "decoder_agreement": 0.7,
     }
-
-

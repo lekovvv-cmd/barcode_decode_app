@@ -7,3 +7,5 @@ pyzbar>=0.1.9
 python-multipart>=0.0.9
 scikit-image>=0.22
 zxing-cpp>=2.2
+
+ultralytics>=8.2
